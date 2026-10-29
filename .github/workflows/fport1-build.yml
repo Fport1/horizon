@@ -6,7 +6,9 @@
 #
 # Los exportadores de Java (clases propias de Horizon, sin nada de Mojang) se compilan en
 # el proyecto original con su copia del juego; aquí se toman de la release oficial
-# indicada, que es la misma para los tres sistemas.
+# indicada. Solo valen para el código de esa misma release: si no coinciden, horizon-prepare
+# intenta compilarlos y pide un JDK 25 que los jugadores no tienen. Por eso se compila el
+# código de la etiqueta oficial (con lo de la rama fport1/<etiqueta> si existe).
 #
 # Se lanza a mano (Actions → Fport1 build → Run workflow).
 
@@ -95,6 +97,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: El código de la release oficial (o nuestra rama sobre ella)
+        env:
+          TAG: ${{ needs.prepare.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin "refs/heads/fport1/$TAG" > /dev/null; then
+            git fetch origin "fport1/$TAG" && git checkout FETCH_HEAD
+          else
+            git fetch --depth=1 https://github.com/horizon-rust/horizon "refs/tags/$TAG" && git checkout FETCH_HEAD
+          fi
+          git log -1 --oneline
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
