@@ -1,0 +1,156 @@
+# Fport1: nuestra propia versión de Horizon para ModpackLauncher.
+#
+# Compila el juego para Windows, Linux y macOS en los runners de GitHub y lo publica como
+# una release de este fork (fport1-<versión>), con SHA256SUMS. El launcher baja las
+# versiones de aquí y, si este fork no tiene ninguna, las oficiales.
+#
+# Los exportadores de Java (clases propias de Horizon, sin nada de Mojang) se compilan en
+# el proyecto original con su copia del juego; aquí se toman de la release oficial
+# indicada, que es la misma para los tres sistemas.
+#
+# Se lanza a mano (Actions → Fport1 build → Run workflow).
+
+name: Fport1 build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Release oficial de la que se toman los exportadores (vacío = la más nueva)
+        required: false
+        default: ''
+      publish:
+        description: Publicar la release (si no, solo deja los paquetes como artefactos)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream: ${{ steps.pick.outputs.upstream }}
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          tag="$WANT"
+          if [ -z "$tag" ]; then
+            tag=$(gh api repos/horizon-rust/horizon/releases --jq '[.[] | select(.draft|not) | select(.tag_name|startswith("launcher")|not)][0].tag_name')
+          fi
+          echo "upstream=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}-fport1.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+      - name: Exportadores de la release oficial
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ steps.pick.outputs.upstream }}" -R horizon-rust/horizon -p horizon-linux-x86_64.tar.gz
+          tar xzf horizon-linux-x86_64.tar.gz
+          mkdir -p exporters
+          cp -R horizon-linux-x86_64/exporters/. exporters/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: original-exporters
+          path: exporters/
+          if-no-files-found: error
+          retention-days: 3
+
+  build:
+    needs: prepare
+    name: build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-22.04
+            dir: horizon-linux-x86_64
+            asset: horizon-linux-x86_64.tar.gz
+          - name: windows
+            os: windows-latest
+            dir: horizon-windows-x64
+            asset: horizon-windows-x64.zip
+            exe: .exe
+            rustflags: -C target-feature=+crt-static
+          - name: macos
+            os: macos-14
+            dir: horizon-macos-arm64
+            asset: horizon-macos-arm64.zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      HORIZON_VERSION: ${{ needs.prepare.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fport1-${{ matrix.name }}
+      - name: ALSA and udev headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev
+      - name: Build
+        run: cargo build --release --locked --features horizon-client/mods -p horizon-client --bin horizon-client --bin horizon-ctl -p horizon-prepare --bin horizon-prepare -p horizon-server --bin horizon-server
+      - name: Every program starts
+        run: |
+          set -euo pipefail
+          "target/release/horizon-client${{ matrix.exe }}" --help | grep -q -- '--resources'
+          "target/release/horizon-prepare${{ matrix.exe }}" --help | grep -q -- '--minecraft-dir'
+      - uses: actions/download-artifact@v4
+        with:
+          name: original-exporters
+          path: exporters
+      - name: Package
+        run: |
+          set -euo pipefail
+          cargo run --locked -p xtask -- package "target/release/horizon-client${{ matrix.exe }}" "dist/${{ matrix.dir }}"
+          cd dist
+          case "${{ matrix.asset }}" in
+            *.tar.gz) tar czf "${{ matrix.asset }}" "${{ matrix.dir }}" ;;
+            *) if [[ "$RUNNER_OS" == Windows ]]; then 7z a -tzip "${{ matrix.asset }}" "${{ matrix.dir }}" > /dev/null
+               else ditto -c -k --norsrc --noextattr --noqtn --keepParent "${{ matrix.dir }}" "${{ matrix.asset }}"; fi ;;
+          esac
+          ls -l "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [prepare, build]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: horizon-*
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum horizon-*.zip horizon-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          tag="v${{ needs.prepare.outputs.version }}"
+          gh release create "$tag" -R "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "Horizon ${{ needs.prepare.outputs.version }} (Fport1)" \
+            --notes "Versión de Horizon de Fport1 para ModpackLauncher, compilada desde ${{ github.sha }} con los exportadores de ${{ needs.prepare.outputs.upstream }}." \
+            horizon-*.zip horizon-*.tar.gz SHA256SUMS
